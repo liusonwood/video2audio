@@ -102,10 +102,14 @@ def main():
                         help="输出音频格式 (默认: mp3)")
     parser.add_argument("-b", "--bitrate", default="192k",
                         help="音频比特率 (默认: 192k)")
-    parser.add_argument("-j", "--jobs", type=int, default=2,
-                        help="并行转换数量 (默认: 2)")
+    parser.add_argument("-j", "--jobs", type=int, default=0,
+                        help="并行转换数量 (默认: 0 = 自动使用 CPU 逻辑核心数，尽量跑满处理器)")
 
     args = parser.parse_args()
+
+    # 自动选择并行数：0 或负数时使用 CPU 逻辑核心数
+    if args.jobs <= 0:
+        args.jobs = os.cpu_count() or 1
 
     # 校验输入目录
     input_dir = os.path.abspath(args.input_dir)
@@ -127,7 +131,7 @@ def main():
     print(f"🎬 找到 {total_videos} 个视频文件")
     print(f"🎵 输出格式: {args.format} @ {args.bitrate}")
     print(f"📁 输出目录: {output_dir}")
-    print(f"⚙️  并行数:  {args.jobs}")
+    print(f"⚙️  并行数:  {args.jobs} (自动根据 CPU 核心数)")
     print("-" * 65)
 
     # 并行转换
@@ -167,7 +171,7 @@ def main():
                     fail += 1
                     print(f"  [{i}/{total_videos}] ({pct:5.1f}%) [{time_info}] ❌ {name}: {msg}")
     except KeyboardInterrupt:
-        interrupted = False
+        interrupted = True
         print("\n\n⚠️  用户中断 (Ctrl+C)，已完成的结果会保留，下次运行自动恢复")
 
     total_elapsed = time.time() - start_time
