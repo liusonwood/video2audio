@@ -2,6 +2,7 @@
 """
 批量将文件夹中的视频文件转换为音频文件 (默认 MP3)
 带有实时百分比、已用时间与预计剩余时间显示。
+默认动态调整并行数，尽量把 CPU 使用率顶到 95%+。
 """
 
 import os
@@ -10,7 +11,13 @@ import time
 import subprocess
 import argparse
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 # 支持的视频格式
 VIDEO_EXTENSIONS = {
@@ -89,6 +96,137 @@ def find_videos(folder: str) -> list[str]:
     return videos
 
 
+def _run_fixed(videos, output_dir, audio_format, audio_bitrate, jobs):
+    """固定并行数模式（用户指定了 -j）"""
+    success = fail = skipped = 0
+    interrupted = False
+    total = len(videos)
+    start_time = time.time()
+
+    try:
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = {
+                executor.submit(
+                    convert_video_to_audio, v, output_dir, audio_format, audio_bitrate
+                ): v
+                for v in videos
+            }
+            for i, future in enumerate(as_completed(futures), 1):
+                source = futures[future]
+                _, ok, msg = future.result()
+                name = Path(source).name
+
+                elapsed = time.time() - start_time
+                avg = elapsed / i
+                eta = avg * (total - i)
+                pct = (i / total) * 100
+                time_info = f"已用: {format_time(elapsed)} | 剩余: {format_time(eta)}"
+
+                if ok:
+                    success += 1
+                    if "已跳过" in msg:
+                        skipped += 1
+                        print(f"  [{i}/{total}] ({pct:5.1f}%) [{time_info}] ⏭️  {name} (跳过)")
+                    else:
+                        print(f"  [{i}/{total}] ({pct:5.1f}%) [{time_info}] ✅ {name}")
+                else:
+                    fail += 1
+                    print(f"  [{i}/{total}] ({pct:5.1f}%) [{time_info}] ❌ {name}: {msg}")
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n\n⚠️  用户中断 (Ctrl+C)，已完成的结果会保留，下次运行自动恢复")
+
+    return success, fail, skipped, interrupted, time.time() - start_time
+
+
+def _run_dynamic(videos, output_dir, audio_format, audio_bitrate):
+    """动态并行模式：从 cpu_count 起步，逐步加进程直到 CPU ≥ 95% 或达到上限"""
+    cpu_count = os.cpu_count() or 1
+    hard_limit = cpu_count * 5
+    initial = cpu_count
+    target_cpu = 95.0
+    check_interval = 2.5  # 秒
+
+    success = fail = skipped = 0
+    interrupted = False
+    total = len(videos)
+    start_time = time.time()
+    completed = 0
+
+    pending = list(videos)
+    active = {}  # future -> video_path
+
+    # 初始化 CPU 采样（第一次调用会返回 0）
+    psutil.cpu_percent(interval=None)
+
+    print(f"⚙️  动态模式启动：初始 {initial} 进程，上限 {hard_limit}，目标 CPU ≥ {target_cpu:.0f}%")
+
+    try:
+        with ThreadPoolExecutor(max_workers=hard_limit) as executor:
+            # 提交初始批次
+            for _ in range(min(initial, len(pending))):
+                v = pending.pop(0)
+                fut = executor.submit(
+                    convert_video_to_audio, v, output_dir, audio_format, audio_bitrate
+                )
+                active[fut] = v
+
+            while active:
+                done, _ = wait(
+                    active.keys(),
+                    timeout=check_interval,
+                    return_when=FIRST_COMPLETED,
+                )
+
+                # 处理已完成的任务
+                for fut in done:
+                    source = active.pop(fut)
+                    _, ok, msg = fut.result()
+                    name = Path(source).name
+                    completed += 1
+
+                    elapsed = time.time() - start_time
+                    avg = elapsed / completed
+                    eta = avg * (total - completed)
+                    pct = (completed / total) * 100
+                    time_info = f"已用: {format_time(elapsed)} | 剩余: {format_time(eta)}"
+
+                    if ok:
+                        success += 1
+                        if "已跳过" in msg:
+                            skipped += 1
+                            print(f"  [{completed}/{total}] ({pct:5.1f}%) [{time_info}] ⏭️  {name} (跳过)")
+                        else:
+                            print(f"  [{completed}/{total}] ({pct:5.1f}%) [{time_info}] ✅ {name}")
+                    else:
+                        fail += 1
+                        print(f"  [{completed}/{total}] ({pct:5.1f}%) [{time_info}] ❌ {name}: {msg}")
+
+                # 尝试增加进程（只增不减）
+                current_cpu = psutil.cpu_percent(interval=None)
+                added = 0
+                while pending and len(active) < hard_limit:
+                    if current_cpu >= target_cpu:
+                        break
+                    v = pending.pop(0)
+                    fut = executor.submit(
+                        convert_video_to_audio, v, output_dir, audio_format, audio_bitrate
+                    )
+                    active[fut] = v
+                    added += 1
+                    # 每加一个后重新采样，避免一次加太多
+                    current_cpu = psutil.cpu_percent(interval=None)
+
+                if added > 0:
+                    print(f"  📈 动态加进程 +{added} → 当前并发 {len(active)} | CPU {current_cpu:.0f}%")
+
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n\n⚠️  用户中断 (Ctrl+C)，已完成的结果会保留，下次运行自动恢复")
+
+    return success, fail, skipped, interrupted, time.time() - start_time
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="将文件夹中的视频文件批量转换为音频文件"
@@ -103,13 +241,10 @@ def main():
     parser.add_argument("-b", "--bitrate", default="192k",
                         help="音频比特率 (默认: 192k)")
     parser.add_argument("-j", "--jobs", type=int, default=0,
-                        help="并行转换数量 (默认: 0 = 自动使用 CPU 逻辑核心数，尽量跑满处理器)")
+                        help="并行转换数量。默认 0 = 动态模式（自动加进程直到 CPU ≥ 95%%）；"
+                             "指定正整数则固定该并发数")
 
     args = parser.parse_args()
-
-    # 自动选择并行数：0 或负数时使用 CPU 逻辑核心数
-    if args.jobs <= 0:
-        args.jobs = os.cpu_count() or 1
 
     # 校验输入目录
     input_dir = os.path.abspath(args.input_dir)
@@ -131,50 +266,31 @@ def main():
     print(f"🎬 找到 {total_videos} 个视频文件")
     print(f"🎵 输出格式: {args.format} @ {args.bitrate}")
     print(f"📁 输出目录: {output_dir}")
-    print(f"⚙️  并行数:  {args.jobs} (自动根据 CPU 核心数)")
-    print("-" * 65)
 
-    # 并行转换
-    success, fail, skipped = 0, 0, 0
-    interrupted = False
-    start_time = time.time()
+    use_dynamic = args.jobs <= 0
 
-    try:
-        with ThreadPoolExecutor(max_workers=args.jobs) as executor:
-            futures = {
-                executor.submit(
-                    convert_video_to_audio, v, output_dir, args.format, args.bitrate
-                ): v
-                for v in videos
-            }
-            for i, future in enumerate(as_completed(futures), 1):
-                source = futures[future]
-                out_path, ok, msg = future.result()
-                name = Path(source).name
+    if use_dynamic:
+        if not HAS_PSUTIL:
+            print("⚠️  未安装 psutil，无法使用动态模式，回退到静态核心数模式")
+            print("   安装方法: pip install psutil")
+            jobs = os.cpu_count() or 1
+            print(f"⚙️  并行数:  {jobs} (静态)")
+            print("-" * 65)
+            success, fail, skipped, interrupted, total_elapsed = _run_fixed(
+                videos, output_dir, args.format, args.bitrate, jobs
+            )
+        else:
+            print("-" * 65)
+            success, fail, skipped, interrupted, total_elapsed = _run_dynamic(
+                videos, output_dir, args.format, args.bitrate
+            )
+    else:
+        print(f"⚙️  并行数:  {args.jobs} (用户指定，固定)")
+        print("-" * 65)
+        success, fail, skipped, interrupted, total_elapsed = _run_fixed(
+            videos, output_dir, args.format, args.bitrate, args.jobs
+        )
 
-                # 计算百分比与剩余时间 (ETA)
-                elapsed = time.time() - start_time
-                avg_time_per_item = elapsed / i
-                eta = avg_time_per_item * (total_videos - i)
-                pct = (i / total_videos) * 100
-
-                time_info = f"已用: {format_time(elapsed)} | 剩余: {format_time(eta)}"
-
-                if ok:
-                    success += 1
-                    if "已跳过" in msg:
-                        skipped += 1
-                        print(f"  [{i}/{total_videos}] ({pct:5.1f}%) [{time_info}] ⏭️  {name} (跳过)")
-                    else:
-                        print(f"  [{i}/{total_videos}] ({pct:5.1f}%) [{time_info}] ✅ {name}")
-                else:
-                    fail += 1
-                    print(f"  [{i}/{total_videos}] ({pct:5.1f}%) [{time_info}] ❌ {name}: {msg}")
-    except KeyboardInterrupt:
-        interrupted = True
-        print("\n\n⚠️  用户中断 (Ctrl+C)，已完成的结果会保留，下次运行自动恢复")
-
-    total_elapsed = time.time() - start_time
     print("-" * 65)
     new = success - skipped
     status_str = "已中断!" if interrupted else "完成!"
