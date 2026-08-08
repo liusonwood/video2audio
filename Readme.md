@@ -6,7 +6,7 @@
 
 ## ✨ 核心特性
 
-- ⚡ **多线程并发加速**：支持通过 `-j` 参数指定并发线程数，充分利用多核 CPU 性能。
+- ⚡ **多线程并发加速**：默认自动根据 CPU 逻辑核心数选择并行数，尽量把处理器跑满；也可通过 `-j` 手动指定。
 - ⏯️ **智能断点续传**：自动识别已转换且非空的目标文件，重复运行命令自动跳过，无需重复等待。
 - 📊 **实时进度与倒计时**：输出带有完成百分比、已用时间与动态计算的**预计剩余时间（ETA）**。
 - 🎵 **丰富格式支持**：支持导出 MP3, WAV, FLAC, AAC, OGG, M4A, WMA 等多种音频格式，并可自定义比特率（如 192k, 320k）。
@@ -42,7 +42,7 @@
 
 将代码保存为 `video_to_audio.py`。
 
-### 1. 最简用法
+### 1. 最简用法（自动使用全部 CPU 核心）
 转换指定文件夹下的所有视频为 MP3（默认输出到 `<输入目录>/audio_output/`）：
 
 ```bash
@@ -56,7 +56,7 @@ python3 video_to_audio.py /path/to/your/videos
 python3 video_to_audio.py /path/to/videos -o /path/to/output_dir -b 320k
 ```
 
-### 3. 多线程加速转换
+### 3. 手动指定并行数
 开启 **8 线程** 并行快速转换：
 
 ```bash
@@ -77,7 +77,7 @@ python3 video_to_audio.py <input_dir> [选项]
 | `--output` | `-o` | `<输入目录>/audio_output` | 音频输出文件夹路径 |
 | `--format` | `-f` | `mp3` | 输出音频格式，可选: `mp3`, `wav`, `flac`, `aac`, `ogg`, `m4a`, `wma` |
 | `--bitrate` | `-b` | `192k` | 音频比特率，例如 `128k`, `192k`, `320k` |
-| `--jobs` | `-j` | `2` | 并行转换线程数，建议设置为 CPU 核心数 |
+| `--jobs` | `-j` | `0`（自动） | 并行转换线程数。`0` 或负数时自动使用 CPU 逻辑核心数，尽量把处理器跑到 100% |
 
 ---
 
@@ -90,14 +90,13 @@ python3 video_to_audio.py <input_dir> [选项]
 ```zsh
 for i in {01..08}; do
   python3 video_to_audio.py "/Volumes/SAMSUNG/Movie/001 Number block $i" \
-    -o "/Users/username/Desktop/numberblocks_mp3" \
-    -j 8
+    -o "/Users/username/Desktop/numberblocks_mp3"
 done
 ```
 
 ### 导出为 FLAC 无损音频
 ```bash
-python3 video_to_audio.py /Volumes/Media/Concerts -f flac -o /Volumes/Media/FLAC_Audio -j 4
+python3 video_to_audio.py /Volumes/Media/Concerts -f flac -o /Volumes/Media/FLAC_Audio
 ```
 
 ---
